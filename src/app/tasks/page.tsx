@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { authHeaders } from "../../lib/utils/clientAuth";
 import TaskItem from "../../components/tasks/TaskItem";
 import ProtectedRoute from "../../components/auth/ProtectedRoute";
+import { useSearchParams } from "next/navigation";
 
 type Subtask = { _id?: string; title: string; completed: boolean };
 type TaskDoc = {
@@ -20,6 +21,18 @@ type QuizQuestion = {
   correctAnswer: string;
 };
 
+type QuizResult = {
+  score: number;
+  total: number;
+  roadmap: string[];
+  answers: {
+    question: string;
+    submitted: string;
+    correctAnswer: string;
+    isCorrect: boolean;
+  }[];
+};
+
 type Resource = { title: string; url: string; type?: string };
 
 export default function TasksPage() {
@@ -34,23 +47,24 @@ export default function TasksPage() {
   const [quizTask, setQuizTask] = useState<TaskDoc | null>(null);
   const [quizId, setQuizId] = useState<string | null>(null);
   const [answers, setAnswers] = useState<Record<number, string>>({});
-  const [quizScore, setQuizScore] = useState<number | null>(null);
-  const [improvementRoadmap, setImprovementRoadmap] = useState<string[]>([]);
+  const [quizResult, setQuizResult] = useState<QuizResult | null>(null);
 
-  // resources state (for this page)
-  const [resources, setResources] = useState<Resource[]>([]);
-  const [playerUrl, setPlayerUrl] = useState<string>("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const searchParams = useSearchParams();
+  const [quizOpenedFromRedirect, setQuizOpenedFromRedirect] = useState(false);
 
-  async function loadTasks() {
+  /** ✅ stable function */
+  const loadTasks = useCallback(async () => {
     try {
       const res = await fetch("/api/tasks", { headers: { ...authHeaders() } });
       if (!res.ok) return;
       const data = await res.json();
       setTasks(Array.isArray(data) ? (data as TaskDoc[]) : []);
-    } catch {}
-  }
+    } catch (err) {
+      console.error("Failed to load tasks:", err);
+    }
+  }, []);
 
+  /** Create new task */
   async function createTask() {
     setLoading(true);
     setMsg(null);
@@ -63,32 +77,27 @@ export default function TasksPage() {
       if (!res.ok) throw new Error((await res.json()).error || "Failed");
       setTitle("");
       setDescription("");
-      await loadTasks();
+      await loadTasks(); // refresh after create
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "Unknown error";
-      setMsg(message);
+      setMsg(e instanceof Error ? e.message : "Unknown error");
     } finally {
       setLoading(false);
     }
   }
 
-  // quiz handlers
+  /** Take quiz */
   async function handleTakeQuiz(task: TaskDoc) {
     setQuiz([]);
     setAnswers({});
     setQuizTask(task);
-    setQuizScore(null);
-    setImprovementRoadmap([]);
+    setQuizResult(null);
     setQuizId(null);
 
     try {
       const res = await fetch("/api/quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({
-          action: "generate",
-          taskId: task._id,
-        }),
+        body: JSON.stringify({ action: "generate", taskId: task._id }),
       });
       const data = await res.json();
       setQuiz(data.questions || []);
@@ -111,8 +120,7 @@ export default function TasksPage() {
         }),
       });
       const data = await res.json();
-      setQuizScore(data.score);
-      setImprovementRoadmap(data.roadmap || []);
+      setQuizResult(data);
     } catch (e) {
       console.error("Quiz submit failed:", e);
     }
@@ -124,190 +132,69 @@ export default function TasksPage() {
       const res = await fetch("/api/quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({
-          action: "retry",
-          taskId: quizTask._id,
-        }),
+        body: JSON.stringify({ action: "retry", taskId: quizTask._id }),
       });
       const data = await res.json();
       setQuiz(data.questions || []);
       setQuizId(data._id || null);
       setAnswers({});
-      setQuizScore(null);
-      setImprovementRoadmap([]);
+      setQuizResult(null);
     } catch (e) {
       console.error("Quiz retry failed:", e);
     }
   }
 
-  // resources (recommendation)
-  async function callRecommend(query: string) {
-    setNotice(null);
-    setResources([]);
-    setPlayerUrl("");
-    if (!query || !query.trim()) {
-      setNotice("Please provide a search query.");
-      return;
-    }
-    try {
-      const res = await fetch("/api/recommendation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ query }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Recommendation failed");
-      const mapped = Array.isArray(data)
-        ? data
-        : data.resources || data.items || [];
-      const resourcesArr = (mapped as any[]).map((r) => ({
-        title: r.title,
-        url: r.url,
-        type:
-          r.type ||
-          (typeof r.url === "string" && r.url.includes("youtube")
-            ? "youtube"
-            : "link"),
-      }));
-      setResources(resourcesArr);
-      const liveCount = resourcesArr.filter(
-        (r) => typeof r.url === "string" && r.url.includes("youtube.com/watch")
-      ).length;
-      setNotice(
-        liveCount > 0
-          ? `Fetched ${resourcesArr.length} resources (${liveCount} YouTube).`
-          : `Fetched ${resourcesArr.length} resources.`
-      );
-    } catch (e) {
-      console.error("Recommendation failed:", e);
-      setNotice("Failed to fetch recommendations.");
-    }
-  }
-
+  /** Initial load */
   useEffect(() => {
     loadTasks();
-  }, []);
+  }, [loadTasks]);
+
+  /** Auto-open quiz after redirect */
+  useEffect(() => {
+    if (quizOpenedFromRedirect) return;
+
+    const taskId = searchParams.get("taskId");
+    const quizIdParam = searchParams.get("quizId");
+
+    if (taskId && tasks.length > 0) {
+      const task = tasks.find((t) => t._id === taskId);
+      if (task) {
+        handleTakeQuiz(task);
+        if (quizIdParam) setQuizId(quizIdParam);
+        setQuizOpenedFromRedirect(true);
+      }
+    }
+  }, [tasks, searchParams, quizOpenedFromRedirect]);
 
   return (
     <ProtectedRoute>
       <div className="max-w-5xl mx-auto space-y-8 p-6">
         <h1 className="text-2xl font-semibold">Tasks</h1>
 
-        {/* Create Task */}
-        <div className="bg-white border p-6 rounded-lg shadow-sm">
-          <h2 className="font-medium mb-3">Create New Task</h2>
-          <div className="flex flex-col gap-3">
-            <input
-              className="border rounded px-3 py-2 focus:outline-none focus:ring focus:border-indigo-400"
-              placeholder="Task title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-            />
-            <textarea
-              className="border rounded px-3 py-2 focus:outline-none focus:ring focus:border-indigo-400"
-              placeholder="Description (optional)"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-            <div className="flex items-center gap-3">
-              <button
-                disabled={loading}
-                onClick={createTask}
-                className="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 disabled:opacity-50"
-              >
-                {loading ? "Saving..." : "Add Task"}
-              </button>
-              {msg && <p className="text-sm text-red-500">{msg}</p>}
-            </div>
-          </div>
-        </div>
-
-        {/* Resources Panel (Tasks page) */}
-        <div className="bg-white border p-4 rounded-lg shadow-sm">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="font-medium">Recommended Resources</h3>
-            <div className="flex gap-2">
-              <input
-                placeholder="Search resources or use task 'Get Recommendations'"
-                className="border rounded px-3 py-1 text-sm"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter")
-                    callRecommend((e.target as HTMLInputElement).value);
-                }}
-              />
-              <button
-                onClick={() => {
-                  const el = document.querySelector<HTMLInputElement>(
-                    "input[placeholder^='Search resources']"
-                  );
-                  callRecommend(el?.value || "");
-                }}
-                className="text-sm px-3 py-1 rounded bg-indigo-600 text-white"
-              >
-                Search
-              </button>
-            </div>
-          </div>
-
-          {notice && <p className="text-xs text-gray-600 mb-2">{notice}</p>}
-
-          {resources.length > 0 ? (
-            <div className="space-y-3">
-              {resources.map((r, i) => (
-                <div key={i} className="flex items-center justify-between">
-                  <div>
-                    <div className="font-medium">{r.title}</div>
-                    <div className="text-xs text-gray-500">{r.type}</div>
-                  </div>
-                  {r.type === "youtube" &&
-                  typeof r.url === "string" &&
-                  r.url.includes("youtube.com/watch") ? (
-                    <button
-                      className="text-indigo-600 text-sm"
-                      onClick={() => setPlayerUrl(r.url)}
-                    >
-                      Play
-                    </button>
-                  ) : (
-                    <a
-                      href={r.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-indigo-600 text-sm"
-                    >
-                      Open
-                    </a>
-                  )}
-                </div>
-              ))}
-
-              {playerUrl && (
-                <div className="mt-2">
-                  <iframe
-                    width="100%"
-                    height="300"
-                    src={`https://www.youtube.com/embed/${
-                      playerUrl.split("v=")[1]?.split("&")[0]
-                    }`}
-                    title="YouTube video player"
-                    frameBorder="0"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowFullScreen
-                  />
-                  <button
-                    onClick={() => setPlayerUrl("")}
-                    className="mt-2 text-xs px-2 py-1 bg-gray-100 rounded"
-                  >
-                    Close player
-                  </button>
-                </div>
-              )}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-500">
-              No resources yet. Use the search or per-task button.
-            </p>
-          )}
+        {/* Task Creation */}
+        <div className="bg-white p-4 rounded shadow-sm border mb-6">
+          <h2 className="font-medium mb-2">Create New Task</h2>
+          {msg && <p className="text-red-500 text-sm mb-2">{msg}</p>}
+          <input
+            type="text"
+            placeholder="Task title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="w-full border rounded px-3 py-2 mb-2 text-sm"
+          />
+          <textarea
+            placeholder="Description (optional)"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            className="w-full border rounded px-3 py-2 mb-2 text-sm"
+          />
+          <button
+            onClick={createTask}
+            disabled={loading || !title.trim()}
+            className="bg-indigo-600 text-white px-4 py-2 rounded disabled:opacity-50"
+          >
+            {loading ? "Creating..." : "Add Task"}
+          </button>
         </div>
 
         {/* Task list */}
@@ -320,16 +207,13 @@ export default function TasksPage() {
                 description: t.description ?? "",
                 subtasks: t.subtasks ?? [],
               }}
-              onUpdated={loadTasks}
               onTakeQuiz={handleTakeQuiz}
-              onRecommend={callRecommend} // pass handler for per-task recommend
+              // ❌ removed onUpdated={loadTasks} to prevent loops
             />
           ))}
 
           {tasks.length === 0 && (
-            <p className="text-gray-500 text-sm">
-              No tasks yet. Create one above!
-            </p>
+            <p className="text-gray-500 text-sm">No tasks yet. Create one above!</p>
           )}
         </div>
 
@@ -337,60 +221,54 @@ export default function TasksPage() {
         {quizTask && quiz.length > 0 && (
           <div className="mt-6 border p-4 rounded bg-white">
             <h2 className="font-medium mb-2">Quiz: {quizTask.title}</h2>
-            <ul className="space-y-4">
-              {quiz.map((q, idx) => (
-                <li key={idx}>
-                  <p className="font-medium">{q.question}</p>
-                  <div className="mt-1 space-y-1">
-                    {q.options.map((opt, i) => (
-                      <label key={i} className="flex items-center gap-2">
-                        <input
-                          type="radio"
-                          name={`q-${idx}`}
-                          value={opt}
-                          checked={answers[idx] === opt}
-                          onChange={() =>
-                            setAnswers({ ...answers, [idx]: opt })
-                          }
-                        />
-                        <span>{opt}</span>
-                      </label>
-                    ))}
-                  </div>
-                </li>
-              ))}
-            </ul>
 
-            <div className="mt-4 flex gap-3">
-              <button
-                className="bg-blue-600 text-white px-4 py-2 rounded"
-                onClick={submitQuiz}
-              >
-                Submit Quiz
-              </button>
-              <button
-                className="bg-gray-100 text-gray-800 px-4 py-2 rounded hover:bg-gray-200"
-                onClick={retryQuiz}
-              >
-                Retry Quiz
-              </button>
-            </div>
-
-            {quizScore !== null && (
-              <p className="mt-2 font-semibold">
-                Your Score: {quizScore}/{quiz.length}
-              </p>
-            )}
-
-            {improvementRoadmap.length > 0 && (
-              <div className="mt-4 bg-gray-50 p-3 rounded">
-                <h3 className="font-medium mb-2">Improvement Roadmap</h3>
-                <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700">
-                  {improvementRoadmap.map((step, idx) => (
-                    <li key={idx}>{step}</li>
+            {!quizResult ? (
+              <>
+                <ul className="space-y-4">
+                  {quiz.map((q, idx) => (
+                    <li key={idx}>
+                      <p className="font-medium">{q.question}</p>
+                      <div className="mt-1 space-y-1">
+                        {q.options.map((opt, i) => (
+                          <label key={i} className="flex items-center gap-2">
+                            <input
+                              type="radio"
+                              name={`q-${idx}`}
+                              value={opt}
+                              checked={answers[idx] === opt}
+                              onChange={() =>
+                                setAnswers({ ...answers, [idx]: opt })
+                              }
+                            />
+                            <span>{opt}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </li>
                   ))}
                 </ul>
-              </div>
+
+                <div className="mt-4 flex gap-3">
+                  <button
+                    className="bg-blue-600 text-white px-4 py-2 rounded"
+                    onClick={submitQuiz}
+                  >
+                    Submit Quiz
+                  </button>
+                  <button
+                    className="bg-gray-100 text-gray-800 px-4 py-2 rounded hover:bg-gray-200"
+                    onClick={retryQuiz}
+                  >
+                    Retry Quiz
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="mt-2 font-semibold">
+                  Your Score: {quizResult.score}/{quizResult.total}
+                </p>
+              </>
             )}
           </div>
         )}

@@ -23,18 +23,14 @@ export async function POST(req: NextRequest) {
     try {
       const resp = await axios.post(
         `${process.env.NEXT_PUBLIC_ML_SERVICE_URL}/quiz`,
-        {
-          topic: task.title,
-          description: task.description || "",
-        }
+        { topic: task.title, description: task.description || "" }
       );
 
-      // ✅ Normalize to schema
       const rawQuestions = resp.data?.quiz || [];
       const questions = rawQuestions.map((q: any) => ({
         question: q.question,
         options: q.options,
-        correctAnswer: q.correctAnswer || q.answer, // normalize here
+        correctAnswer: q.correctAnswer || q.answer,
       }));
 
       const quiz = await Quiz.create({
@@ -42,11 +38,11 @@ export async function POST(req: NextRequest) {
         task: task._id,
         questions,
       });
+
       return NextResponse.json(quiz);
     } catch (err) {
       console.error("Quiz generation failed:", err);
 
-      // fallback quiz
       const fallbackQuestions = [
         {
           question: `What is "${task.title}" mainly about?`,
@@ -65,6 +61,7 @@ export async function POST(req: NextRequest) {
         task: task._id,
         questions: fallbackQuestions,
       });
+
       return NextResponse.json(quiz);
     }
   }
@@ -72,34 +69,45 @@ export async function POST(req: NextRequest) {
   // --- Submit Quiz ---
   if (body.action === "submit") {
     const { quizId, answers } = body as { quizId: string; answers: string[] };
-    const quiz = await Quiz.findById(quizId);
+    const quiz = await Quiz.findById(quizId).populate("task", "title");
     if (!quiz)
       return NextResponse.json({ error: "Quiz not found" }, { status: 404 });
 
     let score = 0;
     const wrongTopics: string[] = [];
 
-    quiz.questions.forEach((q: any, i: number) => {
+    const attemptDetails = quiz.questions.map((q: any, i: number) => {
       const submitted = answers[i];
+      const correct = submitted === q.correctAnswer;
+      if (correct) score++;
+      else wrongTopics.push(q.question);
 
-      // submitted is already the option text from TaskItem.tsx
-      if (submitted === q.correctAnswer) {
-        score++;
-      } else {
-        wrongTopics.push(q.question);
-      }
+      return {
+        question: q.question,
+        submitted,
+        correctAnswer: q.correctAnswer,
+        isCorrect: correct,
+      };
     });
 
     quiz.score = score;
     quiz.lastAttempt = new Date();
-    quiz.attempts = [...(quiz.attempts || []), { score, date: new Date() }];
+
+    const newAttempt = {
+      score,
+      date: new Date(),
+      answers: attemptDetails,
+    };
+
+    quiz.attempts = [...(quiz.attempts || []), newAttempt];
     await quiz.save();
 
-    // ✅ Roadmap generation (same as before)
+    const attemptId = quiz.attempts[quiz.attempts.length - 1]._id?.toString();
+
     let roadmap: string[] = [];
     try {
       const prompt = `The user attempted a quiz on "${
-        quiz.task
+        quiz.task.title
       }" and scored ${score}/${quiz.questions.length}.
 Wrong topics: ${wrongTopics.join(", ") || "None"}.
 Generate a short 5-step improvement roadmap focusing on weak areas.`;
@@ -108,6 +116,7 @@ Generate a short 5-step improvement roadmap focusing on weak areas.`;
         `${process.env.NEXT_PUBLIC_ML_SERVICE_URL}/roadmap`,
         { prompt }
       );
+
       roadmap = resp.data?.roadmap || [];
     } catch (err) {
       console.error("Roadmap generation failed:", err);
@@ -120,23 +129,41 @@ Generate a short 5-step improvement roadmap focusing on weak areas.`;
       ];
     }
 
-    return NextResponse.json({ score, total: quiz.questions.length, roadmap });
+    return NextResponse.json({
+      attemptId,
+      score,
+      total: quiz.questions.length,
+      roadmap,
+      answers: attemptDetails,
+    });
   }
 
-  // --- Retry Quiz ---
+  // --- Retry Quiz (Reuse if exists) ---
   if (body.action === "retry") {
     const { taskId } = body;
     const task = await Task.findById(taskId);
     if (!task)
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
 
+    // ✅ Check if an existing quiz already exists for this user + task
+    let quiz = await Quiz.findOne({ user: user._id, task: task._id }).sort({
+      createdAt: -1,
+    });
+
+    if (quiz) {
+      // just return the existing quiz
+      return NextResponse.json({
+        _id: quiz._id,
+        task: quiz.task,
+        questions: quiz.questions,
+      });
+    }
+
+    // ❌ if no quiz found → generate a new one
     try {
       const resp = await axios.post(
         `${process.env.NEXT_PUBLIC_ML_SERVICE_URL}/quiz`,
-        {
-          topic: task.title,
-          description: task.description || "",
-        }
+        { topic: task.title, description: task.description || "" }
       );
 
       const rawQuestions = resp.data?.quiz || [];
@@ -146,16 +173,24 @@ Generate a short 5-step improvement roadmap focusing on weak areas.`;
         correctAnswer: q.correctAnswer || q.answer,
       }));
 
-      const quiz = await Quiz.findOneAndUpdate(
-        { task: task._id, user: user._id },
-        { questions, score: 0, lastAttempt: null, attempts: [] },
-        { new: true, upsert: true }
-      );
+      quiz = await Quiz.create({
+        user: user._id,
+        task: task._id,
+        questions,
+        score: 0,
+        attempts: [],
+      });
 
-      return NextResponse.json(quiz);
+      return NextResponse.json({
+        _id: quiz._id,
+        task: quiz.task,
+        questions: quiz.questions,
+      });
     } catch (err) {
       console.error("Quiz retry failed:", err);
       return NextResponse.json({
+        _id: "fallback",
+        task: taskId,
         questions: [
           {
             question: "Placeholder: What is a variable in programming?",

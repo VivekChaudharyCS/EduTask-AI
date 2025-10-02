@@ -6,9 +6,17 @@ export interface IQuestion {
   correctAnswer: string; // correct answer
 }
 
+export interface IAnswerDetail {
+  question: string;
+  submitted: string;
+  correctAnswer: string;
+  isCorrect: boolean;
+}
+
 export interface IAttempt {
   date: Date;
   score: number;
+  answers: IAnswerDetail[]; // ✅ detailed per-question tracking
 }
 
 export interface IQuiz extends Document {
@@ -26,9 +34,17 @@ const QuestionSchema = new Schema<IQuestion>({
   correctAnswer: { type: String, required: true },
 });
 
+const AnswerDetailSchema = new Schema<IAnswerDetail>({
+  question: { type: String, required: true },
+  submitted: { type: String, required: true },
+  correctAnswer: { type: String, required: true },
+  isCorrect: { type: Boolean, required: true },
+});
+
 const AttemptSchema = new Schema<IAttempt>({
   date: { type: Date, default: Date.now },
   score: { type: Number, required: true },
+  answers: [AnswerDetailSchema], // ✅ now stores full answers
 });
 
 const QuizSchema = new Schema<IQuiz>(
@@ -38,7 +54,7 @@ const QuizSchema = new Schema<IQuiz>(
     questions: [QuestionSchema],
     score: { type: Number, default: 0 },
     lastAttempt: { type: Date },
-    attempts: [AttemptSchema], // ✅ keep history
+    attempts: [AttemptSchema], // ✅ keep history with answers
   },
   { timestamps: true }
 );
