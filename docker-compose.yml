@@ -1,0 +1,44 @@
+version: "3.9"
+services:
+  mongo:
+    image: mongo:7
+    container_name: edutask-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  ml:
+    build:
+      context: ./ml-service
+    container_name: edutask-ml
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - HF_API_TOKEN=${HF_API_TOKEN}
+      - HF_EMBED_MODEL=${HF_EMBED_MODEL}
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+
+  web:
+    build:
+      context: ./src
+    container_name: edutask-web
+    environment:
+      - ML_SERVICE_URL=http://ml:8000
+      - MONGO_URI=mongodb://mongo:27017
+      - JWT_SECRET=dev-secret-change-me
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - ml
+      - mongo
+
+volumes:
+  mongo_data:
