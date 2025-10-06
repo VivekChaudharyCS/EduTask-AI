@@ -1,10 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { authHeaders, clearAuth } from "../../lib/utils/clientAuth";
+import { authHeaders } from "../../lib/utils/clientAuth";
 import ProgressBar from "../../components/ui/ProgressBar";
 import Link from "next/link";
-import { MessageCircle, X } from "lucide-react";
 import ProtectedRoute from "../../components/auth/ProtectedRoute";
 
 type Progress = {
@@ -14,6 +13,7 @@ type Progress = {
   totalSubtasks: number;
   percentage: number;
 };
+
 type Resource = { title: string; url: string; type?: string };
 
 export default function DashboardPage() {
@@ -26,13 +26,7 @@ export default function DashboardPage() {
   const [playerUrl, setPlayerUrl] = useState<string>("");
   const [notice, setNotice] = useState<string | null>(null);
 
-  // tutor UI
-  const [tutorOpen, setTutorOpen] = useState(false);
-  const [messages, setMessages] = useState<
-    { role: "user" | "ai"; text: string }[]
-  >([]);
-  const [input, setInput] = useState("");
-
+  /** ✅ Load progress */
   async function loadProgress() {
     try {
       const res = await fetch("/api/progress", {
@@ -43,6 +37,7 @@ export default function DashboardPage() {
     } catch {}
   }
 
+  /** ✅ Load roadmap */
   async function fetchRoadmap() {
     try {
       setLoadingRoadmap(true);
@@ -58,6 +53,7 @@ export default function DashboardPage() {
     }
   }
 
+  /** ✅ Regenerate roadmap */
   async function regenerateRoadmap() {
     try {
       setLoadingRoadmap(true);
@@ -74,48 +70,58 @@ export default function DashboardPage() {
     }
   }
 
-  useEffect(() => {
-    loadProgress();
-    fetchRoadmap();
-  }, []);
-
-  async function callRecommend(query: string) {
-    setNotice(null);
+  /** ✅ Unified recommendation loader (from API or localStorage) */
+  async function callRecommend(query?: string) {
+    setNotice("Fetching recommendations...");
     setResources([]);
     setPlayerUrl("");
-    if (!query || !query.trim()) {
-      setNotice("Enter a search term or click a task's Get Recommendations.");
-      return;
-    }
+
     try {
+      // Load contextual query if not provided
+      const taskRes = await fetch("/api/tasks", {
+        headers: { ...authHeaders() },
+      });
+      const taskData = await taskRes.json();
+      const userTasks = Array.isArray(taskData) ? taskData : [];
+      const topTask = userTasks.find((t: any) => !t.completed) || userTasks[0];
+      const contextQuery =
+        query?.trim() || topTask?.title || "general programming";
+
+      // Fetch from API
       const res = await fetch("/api/recommendation", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query: contextQuery }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Recommendation failed");
 
       const mapped = Array.isArray(data)
         ? data
         : data.resources || data.items || [];
+
       const resourcesArr = (mapped as any[]).map((r) => ({
-        title: r.title,
-        url: r.url,
+        title: r.title || contextQuery,
+        url: r.url || "#",
         type:
           r.type ||
           (typeof r.url === "string" && r.url.includes("youtube")
             ? "youtube"
             : "link"),
       }));
+
       setResources(resourcesArr);
-      const liveCount = resourcesArr.filter(
-        (r) => typeof r.url === "string" && r.url.includes("youtube.com/watch")
+
+      // ✅ Save to localStorage for persistence
+      localStorage.setItem("recommendedResources", JSON.stringify(resourcesArr));
+
+      const youtubeCount = resourcesArr.filter((r) =>
+        r.url.includes("youtube.com/watch")
       ).length;
+
       setNotice(
-        liveCount > 0
-          ? `Fetched ${resourcesArr.length} resources (${liveCount} YouTube).`
-          : `Fetched ${resourcesArr.length} resources.`
+        `Fetched ${resourcesArr.length} resources for "${contextQuery}" (${
+          youtubeCount > 0 ? youtubeCount + " YouTube" : "no YouTube"
+        }).`
       );
     } catch (e) {
       console.error("Recommendation failed:", e);
@@ -123,56 +129,50 @@ export default function DashboardPage() {
     }
   }
 
-  async function sendMessage() {
-    if (!input.trim()) return;
-    const msg = { role: "user" as const, text: input.trim() };
-    setMessages((prev) => [...prev, msg]);
-    setInput("");
+  /** ✅ Load progress, roadmap, and localStorage recommendations */
+  useEffect(() => {
+    loadProgress();
+    fetchRoadmap();
 
-    try {
-      const res = await fetch("/api/tutor", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({
-          history: [...messages, msg].map((m) => ({
-            role: m.role === "user" ? "user" : "assistant",
-            content: m.text,
-          })),
-        }),
-      });
-
-      const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", text: data.answer || "Sorry, no reply." },
-      ]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", text: "⚠️ Something went wrong." },
-      ]);
+    // Try to load saved recommendations
+    const saved = localStorage.getItem("recommendedResources");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      setResources(parsed);
+      setNotice(`Loaded ${parsed.length} saved recommendations.`);
+    } else {
+      // fallback: auto-fetch default recommendations
+      callRecommend("general programming resources");
     }
-  }
+
+    // ✅ Auto-sync between tabs
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === "recommendedResources" && e.newValue) {
+        const parsed = JSON.parse(e.newValue);
+        setResources(parsed);
+        setNotice(`Synced ${parsed.length} recommendations from another page.`);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
 
   return (
     <ProtectedRoute>
       <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8 p-6">
-        {/* Left / Main: 2 col space on lg */}
+        {/* Left / Main */}
         <div className="lg:col-span-2 space-y-6">
-          {/* Header */}
           <div className="flex items-center justify-between">
             <h1 className="text-2xl font-semibold">Dashboard</h1>
-            <div className="flex items-center gap-4">
-              <Link
-                href="/tasks"
-                className="text-sm text-indigo-600 hover:underline"
-              >
-                Manage Tasks
-              </Link>
-            </div>
+            <Link
+              href="/tasks"
+              className="text-sm text-indigo-600 hover:underline"
+            >
+              Manage Tasks
+            </Link>
           </div>
 
-          {/* Progress Summary */}
+          {/* ✅ Progress */}
           {progress && (
             <div className="bg-white border rounded-lg shadow-sm p-6">
               <h2 className="font-medium mb-2">Progress Summary</h2>
@@ -193,7 +193,7 @@ export default function DashboardPage() {
             </div>
           )}
 
-          {/* Roadmap preview */}
+          {/* ✅ Roadmap */}
           <div className="bg-white border rounded-lg shadow-sm p-6">
             <div className="flex items-center justify-between mb-2">
               <h2 className="font-medium">Next Steps</h2>
@@ -225,7 +225,7 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Right Sidebar */}
+        {/* ✅ Right Sidebar: Recommended Resources */}
         <aside className="space-y-6">
           <div className="bg-white border rounded-lg shadow-sm p-4">
             <div className="flex items-center justify-between mb-3">
@@ -262,42 +262,36 @@ export default function DashboardPage() {
             )}
 
             {resources.length > 0 ? (
-              resources.map((r, i) => (
-                <div
-                  key={i}
-                  className="flex items-center justify-between py-2 border-b last:border-b-0"
-                >
-                  <div>
-                    <div className="font-medium text-sm">{r.title}</div>
-                    <div className="text-xs text-gray-500">{r.type}</div>
-                  </div>
-                  {r.type === "youtube" &&
-                  typeof r.url === "string" &&
-                  r.url.includes("youtube.com/watch") ? (
-                    <button
-                      onClick={() => setPlayerUrl(r.url)}
-                      className="text-indigo-600 text-sm"
-                    >
-                      Play
-                    </button>
-                  ) : (
+              <ul className="space-y-2 text-sm">
+                {resources.map((r, i) => (
+                  <li key={i} className="flex justify-between items-center">
                     <a
-                      className="text-indigo-600 text-sm"
                       href={r.url}
                       target="_blank"
                       rel="noreferrer"
+                      className="text-indigo-600 hover:underline"
                     >
-                      Open
+                      {r.title}
                     </a>
-                  )}
-                </div>
-              ))
+                    {r.type === "youtube" &&
+                      r.url.includes("youtube.com/watch") && (
+                        <button
+                          onClick={() => setPlayerUrl(r.url)}
+                          className="ml-3 text-xs px-2 py-1 bg-indigo-100 rounded text-indigo-700 hover:bg-indigo-200"
+                        >
+                          ▶ Play
+                        </button>
+                      )}
+                  </li>
+                ))}
+              </ul>
             ) : (
               <p className="text-sm text-gray-500">No resources yet.</p>
             )}
 
+            {/* ✅ YouTube Player */}
             {playerUrl && (
-              <div className="mt-3">
+              <div className="mt-4">
                 <iframe
                   width="100%"
                   height="200"
@@ -310,74 +304,14 @@ export default function DashboardPage() {
                 ></iframe>
                 <button
                   onClick={() => setPlayerUrl("")}
-                  className="mt-2 text-xs px-2 py-1 bg-gray-100 rounded"
+                  className="mt-2 text-xs px-2 py-1 bg-gray-100 rounded hover:bg-gray-200"
                 >
-                  Close
+                  Close Player
                 </button>
               </div>
             )}
           </div>
-
-          {/* small placeholder card for AI Tutor preview */}
-          <div className="bg-white border rounded-lg shadow-sm p-4">
-            <h4 className="font-medium">AI Tutor</h4>
-            <p className="text-sm text-gray-500 mt-2">
-              Open the assistant using the floating icon below.
-            </p>
-          </div>
         </aside>
-
-        {/* Floating AI Tutor / Chatbox */}
-        {!tutorOpen && (
-          <button
-            onClick={() => setTutorOpen(true)}
-            className="fixed bottom-6 right-6 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full p-4 shadow-lg transition"
-          >
-            <MessageCircle className="w-6 h-6" />
-          </button>
-        )}
-
-        {tutorOpen && (
-          <div className="fixed bottom-6 right-6 w-80 h-96 bg-white border rounded-lg shadow-lg flex flex-col">
-            <div className="flex items-center justify-between p-3 border-b">
-              <h2 className="font-medium text-indigo-600">AI Tutor</h2>
-              <button onClick={() => setTutorOpen(false)}>
-                <X className="w-5 h-5 text-gray-500" />
-              </button>
-            </div>
-
-            <div className="flex-1 p-3 overflow-y-auto space-y-2 text-sm">
-              {messages.map((m, idx) => (
-                <div
-                  key={idx}
-                  className={`p-2 rounded-md max-w-[75%] ${
-                    m.role === "user"
-                      ? "ml-auto bg-indigo-100 text-indigo-800"
-                      : "mr-auto bg-gray-100 text-gray-800"
-                  }`}
-                >
-                  {m.text}
-                </div>
-              ))}
-            </div>
-
-            <div className="p-3 border-t flex gap-2">
-              <input
-                className="flex-1 border rounded px-2 py-1 text-sm focus:outline-none"
-                placeholder="Ask anything about your learning journey..."
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-              />
-              <button
-                onClick={sendMessage}
-                className="bg-indigo-600 text-white px-3 py-1 rounded hover:bg-indigo-700 text-sm"
-              >
-                Send
-              </button>
-            </div>
-          </div>
-        )}
       </div>
     </ProtectedRoute>
   );

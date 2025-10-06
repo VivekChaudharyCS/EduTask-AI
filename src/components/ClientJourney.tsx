@@ -6,13 +6,16 @@ import { useRouter, useSearchParams } from "next/navigation";
 type Progress = {
   completedTasks: number;
   totalTasks: number;
+  completedSubtasks: number;
+  totalSubtasks: number;
   quizzesTaken: number;
   avgScore: number;
   percentage: number;
 };
 
 type QuizHistory = {
-  _id: string;
+  _id: string; // attemptId
+  quizId: string; // parent quiz
   date: string;
   score: number;
   taskId: string;
@@ -30,69 +33,85 @@ export default function ClientJourney() {
   const [roadmap, setRoadmap] = useState<string[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [retryLoading, setRetryLoading] = useState<string | null>(null);
 
-  // quiz history
   const [quizHistory, setQuizHistory] = useState<QuizHistory[]>([]);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
-
-  // expanded answers
   const [expandedAnswers, setExpandedAnswers] = useState<
     Record<string, boolean>
   >({});
 
-  // highlight latest attempt
   const searchParams = useSearchParams();
   const latestAttemptId = searchParams.get("attemptId");
-
   const router = useRouter();
 
+  /** 🧩 Load all user data (progress, roadmap, quiz history) */
   async function loadData() {
     try {
       setLoading(true);
 
-      // Progress
-      const progRes = await fetch("/api/progress", {
-        headers: { ...authHeaders() },
-      });
-      if (progRes.ok) setProgress(await progRes.json());
+      const [progRes, roadRes] = await Promise.all([
+        fetch("/api/progress", { headers: { ...authHeaders() } }),
+        fetch("/api/roadmap", { headers: { ...authHeaders() } }),
+      ]);
 
-      // Roadmap
-      const roadRes = await fetch("/api/roadmap", {
-        headers: { ...authHeaders() },
-      });
+      if (progRes.ok) setProgress(await progRes.json());
       if (roadRes.ok) {
         const data = await roadRes.json();
         setRoadmap(data.roadmap || []);
       }
 
-      // Quiz history
       await fetchQuizHistory(1);
+    } catch (err) {
+      console.error("❌ Data load failed:", err);
     } finally {
       setLoading(false);
     }
   }
 
+  /** 🧩 Fetch paginated quiz history */
   async function fetchQuizHistory(pageNum: number) {
-    const res = await fetch(`/api/quiz/history?page=${pageNum}&limit=5`, {
-      headers: { ...authHeaders() },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setQuizHistory(data.attempts || []);
-      setPage(data.page);
-      setTotalPages(data.totalPages);
+    try {
+      const res = await fetch(`/api/quiz/history?page=${pageNum}&limit=5`, {
+        headers: { ...authHeaders() },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setQuizHistory(data.attempts || []);
+        setPage(data.page);
+        setTotalPages(data.totalPages);
+      } else {
+        setQuizHistory([]);
+      }
+    } catch (err) {
+      console.error("❌ Quiz history fetch failed:", err);
+      setQuizHistory([]);
     }
   }
 
+  /** 🔁 Regenerate roadmap */
   async function regenerateRoadmap() {
     try {
       setLoading(true);
+      const taskRes = await fetch("/api/tasks", {
+        headers: { ...authHeaders() },
+      });
+      const tasks = taskRes.ok ? await taskRes.json() : [];
+      const taskTitles = Array.isArray(tasks)
+        ? tasks.map((t: any) => t.title).join(", ")
+        : "";
+
+      const prompt = taskTitles
+        ? `Generate a learning roadmap based on these tasks: ${taskTitles}`
+        : "Generate a general beginner-friendly learning roadmap";
+
       const res = await fetch("/api/roadmap", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ prompt: "Regenerate my learning roadmap" }),
+        body: JSON.stringify({ prompt }),
       });
+
       if (res.ok) {
         const data = await res.json();
         setRoadmap(data.roadmap || []);
@@ -102,36 +121,63 @@ export default function ClientJourney() {
     }
   }
 
+  /** 🎯 Retake specific quiz — ensures correct quizId is fetched */
   async function retryQuiz(taskId: string, quizId?: string) {
-    if (!taskId) return alert("Task ID missing");
-
     try {
+      setRetryLoading(quizId || taskId);
+
+      // Step 1: Try to fetch existing quiz directly
       if (quizId) {
-        // ✅ just reload the existing quiz (don’t generate new)
-        router.push(`/tasks?taskId=${taskId}&quizId=${quizId}`);
-        return;
+        console.log(`🎯 Attempting to load quiz ${quizId}`);
+        const res = await fetch(`/api/quiz/${quizId}`, {
+          headers: { ...authHeaders() },
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          console.log(`✅ Loaded quiz ${data._id}`);
+          router.push(`/tasks?taskId=${data.taskId}&quizId=${data._id}`);
+          return;
+        } else {
+          console.warn(`⚠️ Quiz ${quizId} not found (status ${res.status})`);
+        }
       }
 
-      // fallback: generate new if no quizId found
-      const res = await fetch("/api/quiz", {
+      // Step 2: Attempt to reuse recent quiz for same task
+      const retryRes = await fetch("/api/quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ action: "retry", taskId }),
       });
+      const retryData = await retryRes.json();
 
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Retry failed");
+      if (retryRes.ok && retryData?._id && retryData._id !== "fallback") {
+        console.log(`✅ Using reused quiz ${retryData._id}`);
+        router.push(
+          `/tasks?taskId=${retryData.taskId}&quizId=${retryData._id}`
+        );
+        return;
       }
 
-      const data = await res.json();
-      router.push(`/tasks?taskId=${taskId}&quizId=${data._id}`);
+      // Step 3: Generate a new quiz if needed
+      console.warn("⚠️ Generating a new quiz...");
+      const genRes = await fetch("/api/quiz", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ action: "generate", taskId }),
+      });
+      const newQuiz = await genRes.json();
+
+      router.push(`/tasks?taskId=${taskId}&quizId=${newQuiz._id}`);
     } catch (err) {
-      console.error("Retry failed:", err);
-      alert("Failed to retry quiz. Task might be missing.");
+      console.error("❌ Retry quiz failed:", err);
+      alert("Failed to retry quiz. Please try again later.");
+    } finally {
+      setRetryLoading(null);
     }
   }
 
+  /** Load on mount */
   useEffect(() => {
     loadData();
   }, []);
@@ -140,7 +186,7 @@ export default function ClientJourney() {
     <div className="max-w-5xl mx-auto space-y-8 p-6">
       <h1 className="text-2xl font-semibold">Your Learning Journey</h1>
 
-      {/* Roadmap */}
+      {/* 🧭 Learning Roadmap */}
       <div className="bg-white border rounded-lg shadow-sm p-6">
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-medium">Learning Roadmap</h2>
@@ -152,6 +198,7 @@ export default function ClientJourney() {
             {loading ? "Refreshing..." : "Regenerate"}
           </button>
         </div>
+
         {roadmap.length > 0 ? (
           <>
             <ul className="space-y-3">
@@ -180,40 +227,45 @@ export default function ClientJourney() {
         )}
       </div>
 
-      {/* Progress Overview */}
+      {/* 📊 Progress Overview */}
       {progress && (
         <div className="bg-white border rounded-lg shadow-sm p-6">
           <h2 className="font-medium mb-3">Progress Overview</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm text-gray-700">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 text-sm text-gray-700">
             <div>
-              ✅{" "}
-              <span className="font-semibold">{progress.completedTasks}</span> /{" "}
+              ✅ <strong>{progress.completedTasks}</strong> /{" "}
               {progress.totalTasks} Tasks
             </div>
             <div>
-              📝 <span className="font-semibold">{progress.quizzesTaken}</span>{" "}
-              Quizzes
+              📋 <strong>{progress.completedSubtasks}</strong> /{" "}
+              {progress.totalSubtasks} Subtasks
             </div>
             <div>
-              📊 Avg Score:{" "}
-              <span className="font-semibold">{progress.avgScore}%</span>
+              📝 <strong>{progress.quizzesTaken}</strong> Quizzes
             </div>
             <div>
-              🔄 Overall:{" "}
-              <span className="font-semibold">{progress.percentage}%</span>
+              📊 Avg Score: <strong>{progress.avgScore}%</strong>
+            </div>
+            <div>
+              🔄 Overall Progress: <strong>{progress.percentage}%</strong>
             </div>
           </div>
         </div>
       )}
 
-      {/* Quiz History */}
+      {/* 🧩 Quiz History */}
       <div className="bg-white border rounded-lg shadow-sm p-6">
         <h2 className="font-medium mb-3">Quiz History</h2>
-        {quizHistory.length > 0 ? (
+
+        {loading ? (
+          <p className="text-gray-500 text-sm">Loading quiz history...</p>
+        ) : quizHistory.length > 0 ? (
           <div className="space-y-4">
             {quizHistory.map((attempt) => {
               const expandedAns = expandedAnswers[attempt._id] || false;
-              const highlight = latestAttemptId === attempt._id; // ✅ highlight if latest
+              const highlight = latestAttemptId === attempt._id;
+              const isLoading =
+                retryLoading === attempt._id || retryLoading === attempt.taskId;
 
               return (
                 <div
@@ -235,6 +287,7 @@ export default function ClientJourney() {
                   <p className="text-sm font-medium mb-2">
                     Score: {attempt.score}/{attempt.answers.length}
                   </p>
+
                   <ul className="space-y-2">
                     {(expandedAns
                       ? attempt.answers
@@ -260,6 +313,7 @@ export default function ClientJourney() {
                       </li>
                     ))}
                   </ul>
+
                   {attempt.answers.length > 3 && (
                     <button
                       onClick={() =>
@@ -273,40 +327,28 @@ export default function ClientJourney() {
                       {expandedAns ? "Show Less" : "Show More"}
                     </button>
                   )}
+
                   <button
-                    onClick={() => retryQuiz(attempt.taskId, attempt._id)} // ✅ pass quizId
-                    className="mt-3 px-3 py-1 text-sm rounded bg-indigo-600 text-white hover:bg-indigo-700"
+                    onClick={() => retryQuiz(attempt.taskId, attempt.quizId)}
+                    disabled={isLoading}
+                    className={`mt-3 px-3 py-1 text-sm rounded text-white ${
+                      isLoading
+                        ? "bg-gray-400 cursor-not-allowed"
+                        : "bg-indigo-600 hover:bg-indigo-700"
+                    }`}
                   >
-                    Retake Quiz
+                    {isLoading ? "Resuming..." : "Retake Quiz"}
                   </button>
                 </div>
               );
             })}
           </div>
         ) : (
-          <p className="text-gray-500 text-sm">No quiz attempts yet.</p>
-        )}
-
-        {/* Pagination */}
-        {totalPages > 1 && (
-          <div className="flex items-center justify-center gap-4 mt-4">
-            <button
-              disabled={page === 1}
-              onClick={() => fetchQuizHistory(page - 1)}
-              className="px-3 py-1 text-sm bg-gray-200 rounded disabled:opacity-50"
-            >
-              Prev
-            </button>
-            <span className="text-sm">
-              Page {page} of {totalPages}
-            </span>
-            <button
-              disabled={page === totalPages}
-              onClick={() => fetchQuizHistory(page + 1)}
-              className="px-3 py-1 text-sm bg-gray-200 rounded disabled:opacity-50"
-            >
-              Next
-            </button>
+          <div className="p-6 text-center border rounded-lg bg-gray-50 text-gray-500">
+            <p className="text-sm">📝 You haven’t taken any quizzes yet.</p>
+            <p className="text-xs mt-1">
+              Start by completing a task and taking your first quiz!
+            </p>
           </div>
         )}
       </div>

@@ -3,6 +3,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect } from "react";
 import { getToken, clearAuth } from "../../lib/utils/clientAuth";
+import { FaUserCircle } from "react-icons/fa";
 
 const navItems = [
   { name: "Dashboard", href: "/dashboard" },
@@ -52,7 +53,7 @@ export default function Navbar() {
             onClick={() => setOpen(!open)}
             className="w-9 h-9 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-semibold focus:outline-none"
           >
-            VK
+          <FaUserCircle />
           </button>
           {open && (
             <div className="absolute right-0 mt-2 w-40 bg-white border rounded-lg shadow-md py-2 text-sm">

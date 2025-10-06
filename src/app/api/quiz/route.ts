@@ -8,12 +8,13 @@ import axios from "axios";
 export async function POST(req: NextRequest) {
   await connectDB();
   const user = await getUserFromReq(req);
-  if (!user)
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await req.json();
 
-  // --- Generate Quiz ---
+  /**
+   * --- Generate Quiz ---
+   */
   if (body.action === "generate") {
     const { taskId } = body;
     const task = await Task.findById(taskId);
@@ -33,16 +34,24 @@ export async function POST(req: NextRequest) {
         correctAnswer: q.correctAnswer || q.answer,
       }));
 
+      // ✅ create quiz document (persistent)
       const quiz = await Quiz.create({
         user: user._id,
         task: task._id,
         questions,
+        attempts: [],
       });
 
-      return NextResponse.json(quiz);
+      return NextResponse.json({
+        _id: quiz._id,
+        taskId: task._id,
+        taskTitle: task.title,
+        questions: quiz.questions,
+      });
     } catch (err) {
-      console.error("Quiz generation failed:", err);
+      console.error("❌ Quiz generation failed:", err);
 
+      // fallback static quiz
       const fallbackQuestions = [
         {
           question: `What is "${task.title}" mainly about?`,
@@ -60,16 +69,28 @@ export async function POST(req: NextRequest) {
         user: user._id,
         task: task._id,
         questions: fallbackQuestions,
+        attempts: [],
       });
 
-      return NextResponse.json(quiz);
+      return NextResponse.json({
+        _id: quiz._id,
+        taskId: task._id,
+        taskTitle: task.title,
+        questions: fallbackQuestions,
+      });
     }
   }
 
-  // --- Submit Quiz ---
+  /**
+   * --- Submit Quiz ---
+   */
   if (body.action === "submit") {
-    const { quizId, answers } = body as { quizId: string; answers: string[] };
-    const quiz = await Quiz.findById(quizId).populate("task", "title");
+    const { quizId, answers } = body;
+    const quiz = await Quiz.findOne({ _id: quizId, user: user._id }).populate(
+      "task",
+      "title"
+    );
+
     if (!quiz)
       return NextResponse.json({ error: "Quiz not found" }, { status: 404 });
 
@@ -99,16 +120,15 @@ export async function POST(req: NextRequest) {
       answers: attemptDetails,
     };
 
-    quiz.attempts = [...(quiz.attempts || []), newAttempt];
+    quiz.attempts.push(newAttempt);
     await quiz.save();
 
-    const attemptId = quiz.attempts[quiz.attempts.length - 1]._id?.toString();
+    const attemptId = quiz.attempts.at(-1)?._id?.toString();
 
+    // 🧭 Generate roadmap based on mistakes
     let roadmap: string[] = [];
     try {
-      const prompt = `The user attempted a quiz on "${
-        quiz.task.title
-      }" and scored ${score}/${quiz.questions.length}.
+      const prompt = `The user attempted a quiz on "${quiz.task.title}" and scored ${score}/${quiz.questions.length}.
 Wrong topics: ${wrongTopics.join(", ") || "None"}.
 Generate a short 5-step improvement roadmap focusing on weak areas.`;
 
@@ -138,28 +158,34 @@ Generate a short 5-step improvement roadmap focusing on weak areas.`;
     });
   }
 
-  // --- Retry Quiz (Reuse if exists) ---
+  /**
+   * --- Retry Quiz ---
+   * (Reuses last quiz for same task/user if exists)
+   */
   if (body.action === "retry") {
     const { taskId } = body;
     const task = await Task.findById(taskId);
     if (!task)
       return NextResponse.json({ error: "Task not found" }, { status: 404 });
 
-    // ✅ Check if an existing quiz already exists for this user + task
-    let quiz = await Quiz.findOne({ user: user._id, task: task._id }).sort({
-      createdAt: -1,
-    });
+    // ✅ Reuse most recent quiz for same task & user
+    const existingQuiz = await Quiz.findOne({
+      user: user._id,
+      task: task._id,
+    })
+      .sort({ createdAt: -1 })
+      .populate("task", "title");
 
-    if (quiz) {
-      // just return the existing quiz
+    if (existingQuiz) {
       return NextResponse.json({
-        _id: quiz._id,
-        task: quiz.task,
-        questions: quiz.questions,
+        _id: existingQuiz._id,
+        taskId: existingQuiz.task._id,
+        taskTitle: existingQuiz.task.title,
+        questions: existingQuiz.questions,
       });
     }
 
-    // ❌ if no quiz found → generate a new one
+    // 🆕 Otherwise, generate new quiz
     try {
       const resp = await axios.post(
         `${process.env.NEXT_PUBLIC_ML_SERVICE_URL}/quiz`,
@@ -173,24 +199,25 @@ Generate a short 5-step improvement roadmap focusing on weak areas.`;
         correctAnswer: q.correctAnswer || q.answer,
       }));
 
-      quiz = await Quiz.create({
+      const quiz = await Quiz.create({
         user: user._id,
         task: task._id,
         questions,
-        score: 0,
         attempts: [],
       });
 
       return NextResponse.json({
         _id: quiz._id,
-        task: quiz.task,
+        taskId: quiz.task,
+        taskTitle: task.title,
         questions: quiz.questions,
       });
     } catch (err) {
       console.error("Quiz retry failed:", err);
       return NextResponse.json({
         _id: "fallback",
-        task: taskId,
+        taskId: task._id,
+        taskTitle: task.title,
         questions: [
           {
             question: "Placeholder: What is a variable in programming?",

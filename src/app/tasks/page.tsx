@@ -49,6 +49,11 @@ export default function TasksPage() {
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [quizResult, setQuizResult] = useState<QuizResult | null>(null);
 
+  // recommendations
+  const [recommendations, setRecommendations] = useState<Resource[]>([]);
+  const [recNotice, setRecNotice] = useState<string | null>(null);
+  const [playerUrl, setPlayerUrl] = useState<string>("");
+
   const searchParams = useSearchParams();
   const [quizOpenedFromRedirect, setQuizOpenedFromRedirect] = useState(false);
 
@@ -77,7 +82,7 @@ export default function TasksPage() {
       if (!res.ok) throw new Error((await res.json()).error || "Failed");
       setTitle("");
       setDescription("");
-      await loadTasks(); // refresh after create
+      await loadTasks();
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : "Unknown error");
     } finally {
@@ -128,13 +133,33 @@ export default function TasksPage() {
 
   async function retryQuiz() {
     if (!quizTask) return;
+
     try {
+      if (quizId) {
+        const existing = await fetch(`/api/quiz/${quizId}`, {
+          headers: { ...authHeaders() },
+        });
+
+        if (existing.ok) {
+          const data = await existing.json();
+          setQuiz(data.questions || []);
+          setQuizId(data._id);
+          setAnswers({});
+          setQuizResult(null);
+          console.log("✅ Loaded existing quiz:", data._id);
+          return;
+        }
+      }
+
+      // 🔄 If quiz not found, generate new
+      console.warn("⚠️ Existing quiz not found, generating new one...");
       const res = await fetch("/api/quiz", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ action: "retry", taskId: quizTask._id }),
+        body: JSON.stringify({ action: "generate", taskId: quizTask._id }),
       });
       const data = await res.json();
+
       setQuiz(data.questions || []);
       setQuizId(data._id || null);
       setAnswers({});
@@ -144,27 +169,134 @@ export default function TasksPage() {
     }
   }
 
+  /** ✅ Handle Recommendations and Save to LocalStorage */
+  async function handleRecommend(query: string) {
+    setRecNotice("Fetching recommendations...");
+    setRecommendations([]);
+    setPlayerUrl("");
+
+    try {
+      const res = await fetch("/api/recommendation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ query }),
+      });
+      const data = await res.json();
+
+      const mapped = Array.isArray(data)
+        ? data
+        : data.resources || data.items || [];
+
+      const formatted = (mapped as any[]).map((r) => ({
+        title: r.title || "Untitled",
+        url: r.url || "#",
+        type:
+          r.type ||
+          (typeof r.url === "string" && r.url.includes("youtube")
+            ? "youtube"
+            : "link"),
+      }));
+
+      // ✅ Save to state and localStorage
+      setRecommendations(formatted);
+      localStorage.setItem("recommendedResources", JSON.stringify(formatted));
+
+      setRecNotice(
+        formatted.length > 0
+          ? `Fetched ${formatted.length} resources for "${query}".`
+          : "No recommendations found."
+      );
+    } catch (err) {
+      console.error("Recommendation failed:", err);
+      setRecNotice("Failed to fetch recommendations.");
+    }
+  }
+
   /** Initial load */
   useEffect(() => {
     loadTasks();
+
+    // ✅ Restore recommendations from localStorage
+    const stored = localStorage.getItem("recommendedResources");
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      setRecommendations(parsed);
+      setRecNotice(`Loaded ${parsed.length} saved recommendations.`);
+    }
   }, [loadTasks]);
 
-  /** Auto-open quiz after redirect */
   useEffect(() => {
-    if (quizOpenedFromRedirect) return;
+    console.log("📘 Quiz state updated:", {
+      quizTask,
+      quizId,
+      quizLength: quiz.length,
+    });
+  }, [quizTask, quizId, quiz.length]);
 
+  /** Auto-open quiz after redirect (fixed and safe) */
+  /** ✅ Auto-open quiz after redirect (stable fix for retake flow) */
+  useEffect(() => {
     const taskId = searchParams.get("taskId");
     const quizIdParam = searchParams.get("quizId");
 
-    if (taskId && tasks.length > 0) {
-      const task = tasks.find((t) => t._id === taskId);
-      if (task) {
-        handleTakeQuiz(task);
-        if (quizIdParam) setQuizId(quizIdParam);
-        setQuizOpenedFromRedirect(true);
+    // 🚫 no params, skip
+    if (!taskId && !quizIdParam) return;
+
+    // 👇 reset previous quiz state (so it re-renders cleanly)
+    setQuiz([]);
+    setQuizTask(null);
+    setQuizId(null);
+    setQuizResult(null);
+    setAnswers({});
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        if (quizIdParam) {
+          console.log("🔍 Loading quiz from redirect:", quizIdParam);
+          const res = await fetch(`/api/quiz/${quizIdParam}`, {
+            headers: { ...authHeaders() },
+          });
+
+          if (!res.ok) {
+            console.warn("⚠️ Quiz not found, skipping render.");
+            return;
+          }
+
+          const data = await res.json();
+          if (cancelled) return;
+
+          console.log("🧩 Received quiz data from API:", data);
+
+          // ✅ set all quiz states
+          setQuiz(data.questions || []);
+          setQuizId(data._id);
+          setQuizTask({
+            _id: data.taskId,
+            title: data.taskTitle,
+            description: "",
+          });
+          setQuizOpenedFromRedirect(true);
+
+          console.log("✅ Quiz loaded successfully:", data._id);
+        } else if (taskId) {
+          const task = tasks.find((t) => t._id === taskId);
+          if (task) {
+            console.log("🧠 Generating quiz for task:", task.title);
+            await handleTakeQuiz(task);
+            if (!cancelled) setQuizOpenedFromRedirect(true);
+          }
+        }
+      } catch (err) {
+        console.error("❌ Quiz auto-load failed:", err);
       }
-    }
-  }, [tasks, searchParams, quizOpenedFromRedirect]);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams, tasks]);
 
   return (
     <ProtectedRoute>
@@ -197,7 +329,62 @@ export default function TasksPage() {
           </button>
         </div>
 
-        {/* Task list */}
+        {/* ✅ Recommendation Panel */}
+        {recNotice && <p className="text-sm text-gray-500 mt-4">{recNotice}</p>}
+
+        {recommendations.length > 0 && (
+          <div className="mt-4 border rounded-lg bg-white shadow-sm p-4">
+            <h3 className="font-semibold mb-2">Recommended Resources</h3>
+            <ul className="space-y-2 text-sm">
+              {recommendations.map((r, i) => (
+                <li key={i} className="flex justify-between items-center">
+                  <a
+                    href={r.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-indigo-600 hover:underline"
+                  >
+                    {r.title}
+                  </a>
+                  {r.type === "youtube" &&
+                    typeof r.url === "string" &&
+                    r.url.includes("youtube.com/watch") && (
+                      <button
+                        onClick={() => setPlayerUrl(r.url)}
+                        className="ml-3 text-xs px-2 py-1 bg-indigo-100 rounded text-indigo-700 hover:bg-indigo-200"
+                      >
+                        ▶ Play
+                      </button>
+                    )}
+                </li>
+              ))}
+            </ul>
+
+            {/* YouTube Player */}
+            {playerUrl && (
+              <div className="mt-4">
+                <iframe
+                  width="100%"
+                  height="300"
+                  src={`https://www.youtube.com/embed/${
+                    playerUrl.split("v=")[1]?.split("&")[0]
+                  }`}
+                  title="YouTube Player"
+                  frameBorder="0"
+                  allowFullScreen
+                ></iframe>
+                <button
+                  onClick={() => setPlayerUrl("")}
+                  className="mt-2 text-xs bg-gray-100 px-3 py-1 rounded hover:bg-gray-200"
+                >
+                  Close Player
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Task List */}
         <div className="grid gap-4">
           {tasks.map((t) => (
             <TaskItem
@@ -208,67 +395,74 @@ export default function TasksPage() {
                 subtasks: t.subtasks ?? [],
               }}
               onTakeQuiz={handleTakeQuiz}
-              // ❌ removed onUpdated={loadTasks} to prevent loops
+              onRecommend={handleRecommend}
             />
           ))}
 
           {tasks.length === 0 && (
-            <p className="text-gray-500 text-sm">No tasks yet. Create one above!</p>
+            <p className="text-gray-500 text-sm">
+              No tasks yet. Create one above!
+            </p>
           )}
         </div>
 
         {/* Quiz Section */}
-        {quizTask && quiz.length > 0 && (
+        {/* Quiz Section */}
+        {(quizTask || quiz.length > 0) && (
           <div className="mt-6 border p-4 rounded bg-white">
-            <h2 className="font-medium mb-2">Quiz: {quizTask.title}</h2>
+            <h2 className="font-medium mb-2">
+              Quiz: {quizTask?.title || "Loading..."}
+            </h2>
 
             {!quizResult ? (
-              <>
-                <ul className="space-y-4">
-                  {quiz.map((q, idx) => (
-                    <li key={idx}>
-                      <p className="font-medium">{q.question}</p>
-                      <div className="mt-1 space-y-1">
-                        {q.options.map((opt, i) => (
-                          <label key={i} className="flex items-center gap-2">
-                            <input
-                              type="radio"
-                              name={`q-${idx}`}
-                              value={opt}
-                              checked={answers[idx] === opt}
-                              onChange={() =>
-                                setAnswers({ ...answers, [idx]: opt })
-                              }
-                            />
-                            <span>{opt}</span>
-                          </label>
-                        ))}
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+              quiz.length > 0 ? (
+                <>
+                  <ul className="space-y-4">
+                    {quiz.map((q, idx) => (
+                      <li key={idx}>
+                        <p className="font-medium">{q.question}</p>
+                        <div className="mt-1 space-y-1">
+                          {q.options.map((opt, i) => (
+                            <label key={i} className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                name={`q-${idx}`}
+                                value={opt}
+                                checked={answers[idx] === opt}
+                                onChange={() =>
+                                  setAnswers({ ...answers, [idx]: opt })
+                                }
+                              />
+                              <span>{opt}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
 
-                <div className="mt-4 flex gap-3">
-                  <button
-                    className="bg-blue-600 text-white px-4 py-2 rounded"
-                    onClick={submitQuiz}
-                  >
-                    Submit Quiz
-                  </button>
-                  <button
-                    className="bg-gray-100 text-gray-800 px-4 py-2 rounded hover:bg-gray-200"
-                    onClick={retryQuiz}
-                  >
-                    Retry Quiz
-                  </button>
-                </div>
-              </>
+                  <div className="mt-4 flex gap-3">
+                    <button
+                      className="bg-blue-600 text-white px-4 py-2 rounded"
+                      onClick={submitQuiz}
+                    >
+                      Submit Quiz
+                    </button>
+                    <button
+                      className="bg-gray-100 text-gray-800 px-4 py-2 rounded hover:bg-gray-200"
+                      onClick={retryQuiz}
+                    >
+                      Retry Quiz
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-gray-500 text-sm">Loading quiz...</p>
+              )
             ) : (
-              <>
-                <p className="mt-2 font-semibold">
-                  Your Score: {quizResult.score}/{quizResult.total}
-                </p>
-              </>
+              <p className="mt-2 font-semibold">
+                Your Score: {quizResult.score}/{quizResult.total}
+              </p>
             )}
           </div>
         )}
